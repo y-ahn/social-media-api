@@ -1,0 +1,92 @@
+version: "3.8"
+
+# ── 바이브코딩 Vol.2 — 소셜 미디어 피드 API ─────────────────────────────
+# PART 8: Docker Compose로 App + MySQL + Redis + Nginx 한번에 실행
+#
+# 실행: docker compose up -d
+# 중지: docker compose down
+# 로그: docker compose logs -f app
+
+services:
+
+  # ── Spring Boot 애플리케이션 ─────────────────────────────────────────
+  app:
+    build: .
+    container_name: social-app
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DB_URL: jdbc:mysql://mysql:3306/social_db?useSSL=false&serverTimezone=Asia/Seoul&characterEncoding=UTF-8
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      mysql:
+        condition: service_healthy   # MySQL 헬스체크 통과 후 시작
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - social-network
+
+  # ── MySQL 8.0 ────────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: social-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: social_db
+      MYSQL_USER: ${DB_USERNAME}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      TZ: Asia/Seoul
+    volumes:
+      - mysql-data:/var/lib/mysql        # 데이터 영속화
+    ports:
+      - "3306:3306"                      # 개발 시 직접 접속용 (운영 시 제거)
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - social-network
+
+  # ── Redis 7 ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: social-redis
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"                      # 개발 시 직접 접속용
+    networks:
+      - social-network
+
+  # ── Nginx (리버스 프록시 + SSL 종료) ─────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: social-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro            # Let's Encrypt 인증서
+    depends_on:
+      - app
+    restart: unless-stopped
+    networks:
+      - social-network
+
+volumes:
+  mysql-data:
+  redis-data:
+
+networks:
+  social-network:
+    driver: bridge

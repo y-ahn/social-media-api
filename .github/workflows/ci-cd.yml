@@ -1,0 +1,155 @@
+# PART 8 — GitHub Actions CI/CD 파이프라인
+# 트리거: PR 생성 시 CI, main 브랜치 머지 시 CD
+
+name: Social Media API CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  JAVA_VERSION: '21'
+  IMAGE_NAME: social-media-api
+
+jobs:
+
+  # ── CI: 테스트 & 코드 품질 검사 ─────────────────────────────────────
+  test:
+    name: Test & Code Quality
+    runs-on: ubuntu-latest
+
+    # 통합 테스트용 MySQL & Redis 서비스
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: social_test
+          MYSQL_USER: test
+          MYSQL_PASSWORD: test
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: 📥 소스 체크아웃
+        uses: actions/checkout@v4
+
+      - name: ☕ JDK 21 설치
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: 📦 Gradle 캐시
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: 🧪 단위 테스트 + 커버리지 측정
+        run: ./gradlew test jacocoTestReport --no-daemon
+        env:
+          SPRING_PROFILES_ACTIVE: test
+
+      - name: 📊 테스트 결과 업로드
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            build/reports/tests/
+            build/reports/jacoco/
+
+      - name: ✅ JaCoCo 커버리지 기준 80% 검사
+        run: ./gradlew jacocoTestCoverageVerification --no-daemon
+
+      - name: 🔍 빌드 검증
+        run: ./gradlew bootJar --no-daemon -x test
+
+  # ── CD: Docker 이미지 빌드 & EC2 배포 (main 브랜치만) ────────────────
+  deploy:
+    name: Build & Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: 📥 소스 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 🐳 Docker Buildx 설정
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔑 Docker Hub 로그인
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 🏗️ Docker 이미지 빌드 & 푸시
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: 🚀 EC2 배포
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key:      ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 새 이미지 Pull
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            # 환경변수 파일 확인
+            cd /home/ec2-user/social-media
+
+            # 기존 앱 컨테이너만 재시작 (DB/Redis는 유지)
+            IMAGE_TAG=${{ github.sha }} \
+            DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }} \
+            IMAGE_NAME=${{ env.IMAGE_NAME }} \
+            docker compose up -d --no-deps app
+
+            # 헬스체크 대기 (최대 60초)
+            for i in $(seq 1 12); do
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/actuator/health)
+              if [ "$STATUS" == "200" ]; then
+                echo "✅ 배포 성공! (${i}번째 시도)"
+                break
+              fi
+              echo "⏳ 헬스체크 대기 중... ($i/12)"
+              sleep 5
+            done
+
+            # 오래된 이미지 정리
+            docker image prune -f
+
+      - name: 💬 Slack 배포 알림
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author
+          text: |
+            ${{ job.status == 'success' && '✅ 배포 성공!' || '❌ 배포 실패!' }}
+            브랜치: ${{ github.ref_name }}
+            커밋: ${{ github.sha }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
